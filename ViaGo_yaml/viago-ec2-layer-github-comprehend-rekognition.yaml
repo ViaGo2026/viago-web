@@ -1,0 +1,913 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "ViaGo EC2, OpenVPN, ALB, single ASG, GitHub source deployment, health check, RDS MariaDB in Seoul, S3/CloudFront upload infrastructure, Comprehend text moderation, and Rekognition image moderation."
+
+Parameters:
+  ProjectName:
+    Description: "Project/service name prefix"
+    Type: String
+    Default: viago
+
+  RegionName:
+    Description: "Logical region name used in resource tags and import names"
+    Type: String
+    AllowedValues:
+      - seoul
+      - saopaulo
+
+  KeyName:
+    Description: "Existing EC2 KeyPair name created by the VPC layer stack"
+    Type: AWS::EC2::KeyPair::KeyName
+
+  SshSourceCidr:
+    Description: "CIDR allowed to SSH into web instances. Seoul OpenVPN subnet is recommended."
+    Type: String
+    Default: 172.16.2.0/24
+
+  AdminIp:
+    Description: "Admin public IP CIDR for OpenVPN SSH access. Example: 203.0.113.10/32"
+    Type: String
+    Default: 0.0.0.0/0
+
+  OpenVpnAmiId:
+    Description: "OpenVPN Access Server AMI ID. Used in Seoul only. Check AWS Marketplace AMI for ap-northeast-2."
+    Type: String
+    Default: ami-051d52e500c684ec4
+
+  OpenVpnPrivateIp:
+    Description: "Fixed private IP for the Seoul OpenVPN management instance. Used in Seoul only."
+    Type: String
+    Default: 172.16.2.100
+
+  InternalPrivateCidr:
+    Description: "Private CIDR range allowed for ICMP and cross-region private access through VPC Peering."
+    Type: String
+    Default: 172.0.0.0/8
+
+  S3UploadBucketName:
+    Description: "S3 bucket name used for ViaGo post image uploads"
+    Type: String
+    Default: viago-travel-image-bucket-1
+
+  S3UploadObjectPrefix:
+    Description: "Object key prefix allowed for ViaGo post image uploads"
+    Type: String
+    Default: posts/*
+
+  AcmCertificateArn:
+    Description: "Optional ACM certificate ARN for HTTPS listener. Leave empty for HTTP-only initial deployment."
+    Type: String
+    Default: ""
+
+  DatabaseName:
+    Description: "Initial application database name created on the Seoul RDS instance"
+    Type: String
+    Default: ViaGoDb
+
+  DBUser:
+    Description: "RDS master username"
+    Type: String
+    Default: viago_admin
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: "[a-zA-Z][a-zA-Z0-9_]*"
+
+  DBPassword:
+    Description: "RDS master password. Used only by the Seoul stack that creates RDS, and injected into env.php for web app DB access."
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    AllowedPattern: '[a-zA-Z0-9!#$%&()*+,.:;<=>?^_`{|}~-]+'
+
+  DBInstanceClass:
+    Description: "RDS DB instance class. Used in Seoul only."
+    Type: String
+    Default: db.t3.micro
+    AllowedValues:
+      - db.t3.micro
+      - db.t4g.micro
+      - db.t3.small
+      - db.t4g.small
+
+  RemoteRdsEndpoint:
+    Description: "Seoul RDS endpoint for non-Seoul stacks. Leave empty in Seoul. For Sao Paulo, paste the RdsEndpointAddress output from the Seoul EC2/RDS stack."
+    Type: String
+    Default: ""
+
+  CloudFrontDomain:
+    Description: "CloudFront distribution domain for ViaGo media. Do not include https://"
+    Type: String
+    AllowedPattern: "^[A-Za-z0-9.-]+$"
+
+  S3UploadRegion:
+    Description: "AWS region of the S3 media bucket"
+    Type: String
+    Default: ap-northeast-2
+
+  ComprehendEnabled:
+    Description: "Enable Amazon Comprehend based advertisement filtering in the ViaGo web app"
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  ComprehendRegion:
+    Description: "AWS region used by the web app when calling Amazon Comprehend"
+    Type: String
+    Default: ap-northeast-2
+
+  AdScoreThreshold:
+    Description: "Review ad-risk score threshold. Scores greater than or equal to this value are flagged for admin review."
+    Type: Number
+    Default: 50
+    MinValue: 0
+    MaxValue: 100
+
+  RekognitionEnabled:
+    Description: "Enable Amazon Rekognition based image moderation in the ViaGo web app. JPG/JPEG/PNG images are moderated."
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  RekognitionRegion:
+    Description: "AWS region used by the web app when calling Amazon Rekognition"
+    Type: String
+    Default: ap-northeast-2
+
+  RekognitionMinConfidence:
+    Description: "Minimum confidence for Rekognition DetectModerationLabels"
+    Type: Number
+    Default: 70
+    MinValue: 0
+    MaxValue: 100
+
+  ImageModerationBlockThreshold:
+    Description: "Image moderation score threshold to treat dangerous images as blocked"
+    Type: Number
+    Default: 85
+    MinValue: 0
+    MaxValue: 100
+
+  ImageModerationFlagThreshold:
+    Description: "Image moderation score threshold to flag uploaded images for admin review"
+    Type: Number
+    Default: 70
+    MinValue: 0
+    MaxValue: 100
+
+  GitRepositoryUrl:
+    Description: "Public GitHub repository URL that contains the ViaGo web application source"
+    Type: String
+    Default: "https://github.com/REPLACE_ME/viago-web.git"
+
+  GitBranch:
+    Description: "Git branch or tag to deploy"
+    Type: String
+    Default: main
+
+  GitAppDirectory:
+    Description: "Directory inside the repository to copy as /var/www/html/travel_review. Use . if the repository root is the app directory."
+    Type: String
+    Default: travel_review
+
+Mappings:
+  WebAmiMap:
+    ap-northeast-2:
+      Ami: ami-035f4c601044a7af4
+    sa-east-1:
+      Ami: ami-04fffa2c75816ca2e
+
+Conditions:
+  IsSeoul: !Equals [!Ref "AWS::Region", ap-northeast-2]
+  HasAcmCertificate: !Not [!Equals [!Ref AcmCertificateArn, ""]]
+
+Resources:
+  # ------------------------------------------------------------
+  # ALB Security Group & ALB
+  # ------------------------------------------------------------
+  WebAlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ProjectName} ${RegionName} Web ALB Security Group"
+      VpcId:
+        Fn::ImportValue: !Sub "${ProjectName}-${RegionName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: "Allow HTTP from internet"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: "Allow HTTPS from internet"
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${RegionName}-web-alb-sg"
+
+  WebAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-${RegionName}-web-alb"
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      SecurityGroups:
+        - !Ref WebAlbSg
+      Subnets:
+        - Fn::ImportValue: !Sub "${ProjectName}-${RegionName}-PubSn1Id"
+        - Fn::ImportValue: !Sub "${ProjectName}-${RegionName}-PubSn2Id"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${RegionName}-web-alb"
+
+  WebAlbTg:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-${RegionName}-web-tg"
+      VpcId:
+        Fn::ImportValue: !Sub "${ProjectName}-${RegionName}-VpcId"
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: "/health.html"
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200-399"
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: "true"
+        - Key: stickiness.type
+          Value: lb_cookie
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: "3600"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${RegionName}-web-tg"
+
+  WebAlbListenerHttp:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WebAlb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: !If
+        - HasAcmCertificate
+        - - Type: redirect
+            RedirectConfig:
+              Protocol: HTTPS
+              Port: "443"
+              StatusCode: HTTP_301
+        - - Type: forward
+            TargetGroupArn: !Ref WebAlbTg
+
+  WebAlbListenerHttps:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasAcmCertificate
+    Properties:
+      LoadBalancerArn: !Ref WebAlb
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref AcmCertificateArn
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebAlbTg
+
+  # ------------------------------------------------------------
+  # Web Security Group
+  # ------------------------------------------------------------
+  WebSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ProjectName} ${RegionName} Web Instance Security Group"
+      VpcId:
+        Fn::ImportValue: !Sub "${ProjectName}-${RegionName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SshSourceCidr
+          Description: "Allow SSH from OpenVPN/admin CIDR"
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref WebAlbSg
+          Description: "Allow HTTP from ALB"
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 172.0.0.0/8
+          Description: "Allow ICMP from private networks"
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${RegionName}-web-sg"
+
+
+  # ------------------------------------------------------------
+  # RDS MariaDB - Seoul only
+  # ------------------------------------------------------------
+  DbSg:
+    Type: AWS::EC2::SecurityGroup
+    Condition: IsSeoul
+    Properties:
+      GroupDescription: !Sub "${ProjectName} Seoul RDS MariaDB Security Group"
+      VpcId:
+        Fn::ImportValue: !Sub "${ProjectName}-${RegionName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref WebSg
+          Description: "Allow MariaDB from Seoul Web EC2 security group"
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref OpenVpnSg
+          Description: "Allow MariaDB from Seoul OpenVPN management instance"
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 172.17.3.0/24
+          Description: "Allow MariaDB from Sao Paulo Web subnet 3 through VPC Peering"
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 172.17.4.0/24
+          Description: "Allow MariaDB from Sao Paulo Web subnet 4 through VPC Peering"
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${RegionName}-rds-sg"
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Condition: IsSeoul
+    Properties:
+      DBSubnetGroupDescription: !Sub "${ProjectName} Seoul RDS DB subnet group"
+      DBSubnetGroupName: !Sub "${ProjectName}-${RegionName}-db-subnet-group"
+      SubnetIds:
+        - Fn::ImportValue: !Sub "${ProjectName}-${RegionName}-DbSn5Id"
+        - Fn::ImportValue: !Sub "${ProjectName}-${RegionName}-DbSn6Id"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${RegionName}-db-subnet-group"
+
+  RdsInstance:
+    Type: AWS::RDS::DBInstance
+    Condition: IsSeoul
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-${RegionName}-rds"
+      Engine: mariadb
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: 20
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: !Ref DatabaseName
+      MasterUsername: !Ref DBUser
+      MasterUserPassword: !Ref DBPassword
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DbSg
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 1
+      Port: 3306
+      AutoMinorVersionUpgrade: true
+      DeletionProtection: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${RegionName}-rds"
+
+
+  # ------------------------------------------------------------
+  # OpenVPN Access Server - Seoul only
+  # ------------------------------------------------------------
+  OpenVpnSg:
+    Type: AWS::EC2::SecurityGroup
+    Condition: IsSeoul
+    Properties:
+      GroupDescription: !Sub "${ProjectName} Seoul OpenVPN Security Group"
+      VpcId:
+        Fn::ImportValue: !Sub "${ProjectName}-${RegionName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AdminIp
+          Description: "Allow SSH from admin IP"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: "Allow HTTPS for OpenVPN client portal"
+        - IpProtocol: tcp
+          FromPort: 943
+          ToPort: 943
+          CidrIp: 0.0.0.0/0
+          Description: "Allow OpenVPN admin web UI"
+        - IpProtocol: tcp
+          FromPort: 945
+          ToPort: 945
+          CidrIp: 0.0.0.0/0
+          Description: "Allow OpenVPN internal communication"
+        - IpProtocol: udp
+          FromPort: 1194
+          ToPort: 1194
+          CidrIp: 0.0.0.0/0
+          Description: "Allow OpenVPN UDP tunnel"
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: !Ref InternalPrivateCidr
+          Description: "Allow ICMP from private networks"
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${RegionName}-openvpn-sg"
+
+  OpenVpnInstance:
+    Type: AWS::EC2::Instance
+    Condition: IsSeoul
+    Properties:
+      ImageId: !Ref OpenVpnAmiId
+      InstanceType: t3.small
+      KeyName: !Ref KeyName
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          PrivateIpAddress: !Ref OpenVpnPrivateIp
+          GroupSet:
+            - !Ref OpenVpnSg
+          SubnetId:
+            Fn::ImportValue: !Sub "${ProjectName}-${RegionName}-PubSn2Id"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${RegionName}-openvpn"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  OpenVpnEip:
+    Type: AWS::EC2::EIP
+    Condition: IsSeoul
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${RegionName}-eip-openvpn"
+
+  OpenVpnEipAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Condition: IsSeoul
+    Properties:
+      AllocationId: !GetAtt OpenVpnEip.AllocationId
+      InstanceId: !Ref OpenVpnInstance
+
+  # ------------------------------------------------------------
+  # IAM Role for EC2
+  # ------------------------------------------------------------
+  WebEc2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${RegionName}-ec2-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: !Sub "${ProjectName}-${RegionName}-s3-access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${ProjectName}-*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${ProjectName}-*/*"
+        - PolicyName: !Sub "${ProjectName}-${RegionName}-post-image-upload"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowViaGoPostMediaUploadAndDelete
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${S3UploadBucketName}/${S3UploadObjectPrefix}"
+        - PolicyName: !Sub "${ProjectName}-${RegionName}-comprehend-access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowViaGoComprehendAdFiltering
+                Effect: Allow
+                Action:
+                  - comprehend:DetectDominantLanguage
+                  - comprehend:DetectKeyPhrases
+                  - comprehend:DetectSentiment
+                Resource: "*"
+        - PolicyName: !Sub "${ProjectName}-${RegionName}-rekognition-access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowViaGoRekognitionImageModeration
+                Effect: Allow
+                Action:
+                  - rekognition:DetectModerationLabels
+                Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${RegionName}-ec2-role"
+
+  WebEc2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${ProjectName}-${RegionName}-ec2-profile"
+      Roles:
+        - !Ref WebEc2Role
+
+  # ------------------------------------------------------------
+  # Launch Template & Auto Scaling Group
+  # ------------------------------------------------------------
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ProjectName}-${RegionName}-lt"
+      VersionDescription: "ViaGo web server launch template with GitHub deployment, S3 upload, Comprehend, and Rekognition IAM"
+      LaunchTemplateData:
+        ImageId: !FindInMap [WebAmiMap, !Ref "AWS::Region", Ami]
+        InstanceType: t3.micro
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Arn: !GetAtt WebEc2InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref WebSg
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Project
+                Value: !Ref ProjectName
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub "${ProjectName}-${RegionName}-web-volume"
+              - Key: Project
+                Value: !Ref ProjectName
+        UserData:
+          Fn::Base64:
+            Fn::Sub:
+              - |
+                #!/bin/bash
+                set -eux
+
+                dnf update -y
+                dnf install -y httpd git wget unzip awscli php-fpm php php-devel php-pdo php-mysqlnd php-mysqli php-json php-mbstring php-gd mariadb105
+
+                # Provide ec2-metadata compatibility for Amazon Linux 2023.
+                cat > /usr/local/bin/ec2-metadata <<'EOS'
+                #!/bin/bash
+                TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+                get_meta() { curl -s -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/$1"; }
+                case "$1" in
+                  -i) echo "instance-id: $(get_meta instance-id)" ;;
+                  -o) echo "local-ipv4: $(get_meta local-ipv4)" ;;
+                  -z) echo "placement: $(get_meta placement/availability-zone)" ;;
+                  *)
+                    echo "instance-id: $(get_meta instance-id)"
+                    echo "local-ipv4: $(get_meta local-ipv4)"
+                    echo "placement: $(get_meta placement/availability-zone)"
+                    ;;
+                esac
+                EOS
+                chmod +x /usr/local/bin/ec2-metadata
+
+                systemctl enable --now php-fpm
+                systemctl enable --now httpd
+
+                # Create a dedicated health check endpoint first so ALB/ASG does not replace instances
+                # while GitHub source deployment is still in progress.
+                mkdir -p /var/www/html
+                cat > /var/www/html/health.html <<'EOF'
+                ok
+                EOF
+                chmod 644 /var/www/html/health.html
+
+                # RDS SSL CA bundle for PDO SSL connections.
+                mkdir -p /etc/pki/tls/certs
+                curl -fsSL -o /etc/pki/tls/certs/global-bundle.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem || true
+
+                # File upload limits for review images/videos.
+                cat > /etc/php.d/99-viago-upload.ini <<'INI'
+                upload_max_filesize = 200M
+                post_max_size = 220M
+                max_execution_time = 300
+                max_input_time = 300
+                memory_limit = 256M
+                INI
+                systemctl restart php-fpm || true
+                systemctl restart httpd || true
+
+                if [ "${RegionName}" = "seoul" ]; then
+                  PAGE_TITLE="ViaGo Seoul Region"
+                  TEST_TEXT="GitHub Source Deployment Test - Seoul"
+                else
+                  PAGE_TITLE="ViaGo Sao Paulo Region"
+                  TEST_TEXT="GitHub Source Deployment Test - Sao Paulo"
+                fi
+
+                SRC_DIR="/opt/viago-web-src"
+                rm -rf "$SRC_DIR"
+
+                echo "Cloning ViaGo web source from GitHub: ${GitRepositoryUrl} branch/tag: ${GitBranch}"
+                if git clone --depth 1 --branch "${GitBranch}" "${GitRepositoryUrl}" "$SRC_DIR"; then
+                  echo "Git clone succeeded"
+
+                  if [ "${GitAppDirectory}" = "." ]; then
+                    APP_SRC="$SRC_DIR"
+                  else
+                    APP_SRC="$SRC_DIR/${GitAppDirectory}"
+                  fi
+
+                  if [ -d "$APP_SRC" ]; then
+                    echo "Deploying app source from: $APP_SRC"
+                    rm -rf /var/www/html/travel_review
+                    mkdir -p /var/www/html
+                    cp -a "$APP_SRC" /var/www/html/travel_review
+
+                    # Root redirect to the web-team app path.
+                    cat > /var/www/html/index.php <<'PHPINDEX'
+                <?php
+                header('Location: /travel_review/');
+                exit;
+                PHPINDEX
+
+                    # Inject environment values collected at EC2 stack deployment time.
+                    # This keeps GitHub as common source code and lets each new ASG instance
+                    # automatically receive the correct RDS/S3/CloudFront configuration.
+                    mkdir -p /var/www/html/travel_review/config
+                    cat > /var/www/html/travel_review/config/env.php <<'PHPENV'
+                <?php
+                define('VIAGO_DB_HOST', '${ResolvedRdsEndpoint}');
+                define('VIAGO_DB_NAME', '${ResolvedDbName}');
+                define('VIAGO_DB_USER', '${ResolvedDbUser}');
+                define('VIAGO_DB_PASS', '${ResolvedDbPassword}');
+                define('VIAGO_S3_BUCKET', '${S3UploadBucketName}');
+                define('VIAGO_S3_REGION', '${S3UploadRegion}');
+                define('VIAGO_CF_DOMAIN', '${CloudFrontDomain}');
+                define('VIAGO_COMPREHEND_ENABLED', '${ComprehendEnabled}');
+                define('VIAGO_COMPREHEND_REGION', '${ComprehendRegion}');
+                define('VIAGO_AD_SCORE_THRESHOLD', ${AdScoreThreshold});
+                define('VIAGO_REKOGNITION_ENABLED', '${RekognitionEnabled}');
+                define('VIAGO_REKOGNITION_REGION', '${RekognitionRegion}');
+                define('VIAGO_REKOGNITION_MIN_CONFIDENCE', ${RekognitionMinConfidence});
+                define('VIAGO_IMAGE_BLOCK_THRESHOLD', ${ImageModerationBlockThreshold});
+                define('VIAGO_IMAGE_FLAG_THRESHOLD', ${ImageModerationFlagThreshold});
+                ?>
+                PHPENV
+
+                    mkdir -p /var/www/html/travel_review/uploads/reviews /var/www/html/travel_review/uploads/profiles || true
+                    chown -R apache:apache /var/www/html/travel_review /var/www/html/index.php || true
+                    chmod -R 755 /var/www/html/travel_review || true
+                    chmod -R 775 /var/www/html/travel_review/uploads || true
+                    chmod 640 /var/www/html/travel_review/config/env.php || true
+
+                    systemctl restart php-fpm || true
+                    systemctl restart httpd || true
+                    echo "ViaGo GitHub deployment completed"
+                  else
+                    echo "Git app directory not found: $APP_SRC"
+                    cat > /var/www/html/index.html <<EOF
+                <!DOCTYPE html>
+                <html lang="ko"><head><meta charset="UTF-8"><title>$PAGE_TITLE</title></head>
+                <body>
+                  <h1>$PAGE_TITLE</h1>
+                  <p>ERROR: Git app directory not found: $APP_SRC</p>
+                  <p>Repository: ${GitRepositoryUrl}</p>
+                  <p>Branch/Tag: ${GitBranch}</p>
+                  <p>GitAppDirectory: ${GitAppDirectory}</p>
+                </body></html>
+                EOF
+                  fi
+                else
+                  echo "Git clone failed: ${GitRepositoryUrl}"
+
+                  TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+                  instance_id=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+                  private_ip=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+                  az_name=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
+
+                  cat > /var/www/html/index.html <<EOF
+                <!DOCTYPE html>
+                <html lang="ko">
+                <head>
+                  <meta charset="UTF-8" />
+                  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+                  <title>$PAGE_TITLE</title>
+                  <style>
+                    body { font-family: Arial, sans-serif; background: #f6f8fb; margin: 0; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+                    .card { background: white; width: 620px; max-width: 90%; padding: 36px; border-radius: 18px; box-shadow: 0 10px 30px rgba(0,0,0,.10); }
+                    h1 { margin: 0 0 12px; font-size: 32px; color: #1f2937; }
+                    p { color: #4b5563; line-height: 1.6; }
+                    .warn { color: #b91c1c; font-weight: 700; }
+                    .meta { background: #eef2ff; padding: 16px; border-radius: 12px; margin-top: 20px; }
+                    .meta p { margin: 6px 0; }
+                    strong { color: #3730a3; }
+                  </style>
+                </head>
+                <body>
+                  <main class="card">
+                    <h1>$PAGE_TITLE</h1>
+                    <p class="warn">Git clone failed. This page was generated by fallback UserData.</p>
+                    <p><b>$TEST_TEXT</b></p>
+                    <div class="meta">
+                      <p><strong>Region:</strong> ${RegionName}</p>
+                      <p><strong>Repository:</strong> ${GitRepositoryUrl}</p>
+                      <p><strong>Branch/Tag:</strong> ${GitBranch}</p>
+                      <p><strong>Instance ID:</strong> $instance_id</p>
+                      <p><strong>Private IP:</strong> $private_ip</p>
+                      <p><strong>Availability Zone:</strong> $az_name</p>
+                    </div>
+                  </main>
+                </body>
+                </html>
+                EOF
+                fi
+              - ResolvedRdsEndpoint: !If [IsSeoul, !GetAtt RdsInstance.Endpoint.Address, !Ref RemoteRdsEndpoint]
+                ResolvedDbName: !Ref DatabaseName
+                ResolvedDbUser: !Ref DBUser
+                ResolvedDbPassword: !Ref DBPassword
+
+
+  AutoScalingGroupWeb:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${ProjectName}-${RegionName}-asg-web"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub "${ProjectName}-${RegionName}-WebSn3Id"
+        - Fn::ImportValue: !Sub "${ProjectName}-${RegionName}-WebSn4Id"
+      TargetGroupARNs:
+        - !Ref WebAlbTg
+      DesiredCapacity: 2
+      MinSize: 2
+      MaxSize: 4
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 600
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${RegionName}-web"
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: !Ref ProjectName
+          PropagateAtLaunch: true
+
+  ScalingPolicyWeb:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroupWeb
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 50
+
+  # ------------------------------------------------------------
+  # CloudWatch Alarms
+  # ------------------------------------------------------------
+  HighCpuAlarmWeb:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${RegionName}-web-cpu-alarm"
+      AlarmDescription: !Sub "${ProjectName} ${RegionName} web ASG average CPU is high"
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 70
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroupWeb
+      TreatMissingData: notBreaching
+
+Outputs:
+  WebAlbDnsName:
+    Description: "ALB DNS name"
+    Value: !GetAtt WebAlb.DNSName
+    Export:
+      Name: !Sub "${ProjectName}-${RegionName}-WebAlbDnsName"
+
+  WebAlbArn:
+    Description: "ALB ARN"
+    Value: !Ref WebAlb
+    Export:
+      Name: !Sub "${ProjectName}-${RegionName}-WebAlbArn"
+
+  WebTargetGroupArn:
+    Description: "Web target group ARN"
+    Value: !Ref WebAlbTg
+    Export:
+      Name: !Sub "${ProjectName}-${RegionName}-WebTargetGroupArn"
+
+  WebSecurityGroupId:
+    Description: "Web EC2 security group ID"
+    Value: !Ref WebSg
+    Export:
+      Name: !Sub "${ProjectName}-${RegionName}-WebSecurityGroupId"
+
+  WebAlbSecurityGroupId:
+    Description: "ALB security group ID"
+    Value: !Ref WebAlbSg
+    Export:
+      Name: !Sub "${ProjectName}-${RegionName}-WebAlbSecurityGroupId"
+
+  OpenVpnSecurityGroupId:
+    Condition: IsSeoul
+    Description: "OpenVPN security group ID"
+    Value: !Ref OpenVpnSg
+    Export:
+      Name: !Sub "${ProjectName}-${RegionName}-OpenVpnSecurityGroupId"
+
+  WebAutoScalingGroupName:
+    Description: "Regional Web Auto Scaling Group name across WebSn3 and WebSn4"
+    Value: !Ref AutoScalingGroupWeb
+    Export:
+      Name: !Sub "${ProjectName}-${RegionName}-WebAsgName"
+
+
+  RdsSecurityGroupId:
+    Condition: IsSeoul
+    Description: "RDS MariaDB security group ID"
+    Value: !Ref DbSg
+    Export:
+      Name: !Sub "${ProjectName}-${RegionName}-RdsSecurityGroupId"
+
+  RdsEndpointAddress:
+    Condition: IsSeoul
+    Description: "RDS MariaDB endpoint address. Use this as RemoteRdsEndpoint in the Sao Paulo EC2 stack."
+    Value: !GetAtt RdsInstance.Endpoint.Address
+    Export:
+      Name: !Sub "${ProjectName}-${RegionName}-RdsEndpointAddress"
+
+  RdsEndpointPort:
+    Condition: IsSeoul
+    Description: "RDS MariaDB endpoint port"
+    Value: !GetAtt RdsInstance.Endpoint.Port
+    Export:
+      Name: !Sub "${ProjectName}-${RegionName}-RdsEndpointPort"
+
+
+  OpenVpnPublicIp:
+    Condition: IsSeoul
+    Description: "OpenVPN Elastic IP"
+    Value: !Ref OpenVpnEip
+    Export:
+      Name: !Sub "${ProjectName}-${RegionName}-OpenVpnPublicIp"
+
+  OpenVpnPrivateIp:
+    Condition: IsSeoul
+    Description: "OpenVPN private IP"
+    Value: !Ref OpenVpnPrivateIp
+    Export:
+      Name: !Sub "${ProjectName}-${RegionName}-OpenVpnPrivateIp"
