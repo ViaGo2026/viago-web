@@ -1,23 +1,26 @@
 <h1>AWS 기반 글로벌 여행 후기 웹 서비스</h1>
+
 <div align="center">
-
-  <img src="https://github.com/user-attachments/assets/eba2c0a1-d226-4ba7-b410-ee1e08a91ac6" width="50%" alt="ViaGo Logo" />
-
-  <br><br>
-
-  <h3>✍️ 여행 기록하기 (사용자 페이지)</h3>
-  <p>글로벌 사용자가 직관적으로 여행 리뷰, 별점, 사진 및 영상을 업로드할 수 있는 메인 UI입니다.</p>
-  <img src="https://github.com/user-attachments/assets/7c8db257-b581-4b15-8f15-8eab9dcfc6b5" width="65%" alt="Travel Post Form" />
-
-  <br><br>
-  <hr style="border: 1px dashed #e1e4e6;" />
-  <br>
-
-  <h3>🤖 AI 기반 게시글 검토 대시보드 (관리자 페이지)</h3>
-  <p>Amazon Rekognition과 Comprehend가 감지한 유해성 점수 및 필터링 사유를 실시간으로 모니터링하고 관리하는 공간입니다.</p>
-  <img src="https://github.com/user-attachments/assets/78421846-9210-41b9-b924-dedef03417f2" width="85%" alt="Admin Dashboard" />
-
+  <img src="https://github.com/user-attachments/assets/eba2c0a1-d226-4ba7-b410-ee1e08a91ac6" width="40%" />
 </div>
+
+<br>
+
+<div align="center">
+  <table border="0" cellpadding="10">
+    <tr>
+      <td width="45%" align="center" valign="top">
+        <h4>📱 Client: 여행 기록하기</h4>
+        <img src="https://github.com/user-attachments/assets/7c8db257-b581-4b15-8f15-8eab9dcfc6b5" width="100%" />
+      </td>
+      <td width="55%" align="center" valign="top">
+        <h4>⚙️ Admin: AI 유해 콘텐츠 검토망</h4>
+        <img src="https://github.com/user-attachments/assets/78421846-9210-41b9-b924-dedef03417f2" width="100%" />
+      </td>
+    </tr>
+  </table>
+</div>
+
 <h2>AWS 구성도</h2>
 <img width="1007" height="879" alt="image" src="https://github.com/user-attachments/assets/04be2de1-8d2c-49c4-97b8-b92e185d1969" />
 
@@ -65,7 +68,9 @@
 | **DevOps & Tools** | `CloudFormation` `CloudWatch` `Grafana`<br>`MobaXTerm` `PuTTYgen` | - IaC(Code 기반 인프라)를 통한 멀티 리전 아키텍처 배포 자동화<br>- 실시간 자원 사용량 모니터링 및 안전한 서버 원격 제어 환경 구축 |
 | **Productivity** | `Notion` `ChatGPT` `VS Code` `draw.io` | - 프로젝트 문서화, 아키텍처 설계, 인프라 코드 작성 및 협업 |
 
-사용된 자원
+
+
+<h2>사용된 자원</h2>
 
 <p align="center">
   <img src="https://github.com/user-attachments/assets/c9179869-7a99-4b6b-b791-f3adb0e3bbc9" width="45%">
